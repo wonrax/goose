@@ -56,13 +56,11 @@ const isUserMessage = (message: Message): boolean => {
 };
 
 export default function ChatView({
-  readyForAutoUserPrompt,
   chat,
   setChat,
   setView,
   setIsGoosehintsModalOpen,
 }: {
-  readyForAutoUserPrompt: boolean;
   chat: ChatType;
   setChat: (chat: ChatType) => void;
   setView: (view: View, viewOptions?: ViewOptions) => void;
@@ -71,7 +69,6 @@ export default function ChatView({
   return (
     <ChatContextManagerProvider>
       <ChatContent
-        readyForAutoUserPrompt={readyForAutoUserPrompt}
         chat={chat}
         setChat={setChat}
         setView={setView}
@@ -87,7 +84,6 @@ function ChatContent({
   setView,
   setIsGoosehintsModalOpen,
 }: {
-  readyForAutoUserPrompt: boolean;
   chat: ChatType;
   setChat: (chat: ChatType) => void;
   setView: (view: View, viewOptions?: ViewOptions) => void;
@@ -280,8 +276,9 @@ function ChatContent({
 
   // Update chat messages when they change and save to sessionStorage
   useEffect(() => {
-    setChat({ ...chat, messages });
-  }, [messages, setChat, chat]);
+    // @ts-expect-error - TypeScript being overly strict about the return type
+    setChat((prevChat: ChatType) => ({ ...prevChat, messages }));
+  }, [messages, setChat]);
 
   useEffect(() => {
     if (messages.length > 0) {
@@ -627,7 +624,7 @@ function ChatContent({
             isLoading={isLoading}
             onStop={onStopGoose}
             commandHistory={commandHistory}
-            initialValue={_input || initialPrompt}
+            initialValue={_input || (hasMessages ? _input : initialPrompt)}
             setView={setView}
             hasMessages={hasMessages}
             numTokens={sessionTokenCount}

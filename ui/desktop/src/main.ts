@@ -15,6 +15,7 @@ import {
 import type { OpenDialogReturnValue } from 'electron';
 import { Buffer } from 'node:buffer';
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import started from 'electron-squirrel-startup';
 import path from 'node:path';
 import { spawn } from 'child_process';
@@ -34,6 +35,21 @@ import {
 import * as crypto from 'crypto';
 import * as electron from 'electron';
 import * as yaml from 'yaml';
+import windowStateKeeper from 'electron-window-state';
+import {
+  setupAutoUpdater,
+  registerUpdateIpcHandlers,
+  setTrayRef,
+  updateTrayMenu,
+  getUpdateAvailable,
+} from './utils/autoUpdater';
+import { UPDATES_ENABLED } from './updates';
+
+// Updater functions (moved here to keep updates.ts minimal for release replacement)
+function shouldSetupUpdater(): boolean {
+  // Setup updater if either the flag is enabled OR dev updates are enabled
+  return UPDATES_ENABLED || process.env.ENABLE_DEV_UPDATES === 'true';
+}
 
 // Define temp directory for pasted images
 const gooseTempDir = path.join(app.getPath('temp'), 'goose-pasted-images');
@@ -253,9 +269,10 @@ app.on('open-url', async (_event, url) => {
     if (parsedUrl.hostname === 'bot' || parsedUrl.hostname === 'recipe') {
       let recipeConfig = null;
       const configParam = parsedUrl.searchParams.get('config');
+      const base64 = decodeURIComponent(configParam || '');
       if (configParam) {
         try {
-          recipeConfig = JSON.parse(Buffer.from(configParam, 'base64').toString('utf-8'));
+          recipeConfig = JSON.parse(Buffer.from(base64, 'base64').toString('utf-8'));
         } catch (e) {
           console.error('Failed to parse bot config:', e);
         }
@@ -337,7 +354,6 @@ const getVersion = () => {
 };
 
 let [provider, model] = getGooseProvider();
-console.log('[main] Got provider and model:', { provider, model });
 
 let sharingUrl = getSharingUrl();
 
@@ -353,8 +369,6 @@ let appConfig = {
   GOOSE_ALLOWLIST_WARNING: process.env.GOOSE_ALLOWLIST_WARNING === 'true',
   secretKey: generateSecretKey(),
 };
-
-console.log('[main] Created appConfig:', appConfig);
 
 // Track windows by ID
 let windowCounter = 0;
@@ -414,13 +428,21 @@ const createChat = async (
     goosedProcess = newGoosedProcess;
   }
 
+  // Load and manage window state
+  const mainWindowState = windowStateKeeper({
+    defaultWidth: 750,
+    defaultHeight: 800,
+  });
+
   const mainWindow = new BrowserWindow({
     titleBarStyle: process.platform === 'darwin' ? 'hidden' : 'default',
     trafficLightPosition: process.platform === 'darwin' ? { x: 16, y: 20 } : undefined,
     vibrancy: process.platform === 'darwin' ? 'window' : undefined,
     frame: process.platform === 'darwin' ? false : true,
-    width: 750,
-    height: 800,
+    x: mainWindowState.x,
+    y: mainWindowState.y,
+    width: mainWindowState.width,
+    height: mainWindowState.height,
     minWidth: 650,
     resizable: true,
     transparent: false,
@@ -443,6 +465,9 @@ const createChat = async (
       partition: 'persist:goose', // Add this line to ensure persistence
     },
   });
+
+  // Let windowStateKeeper manage the window
+  mainWindowState.manage(mainWindow);
 
   // Enable spellcheck / right and ctrl + click on mispelled word
   //
@@ -499,8 +524,6 @@ const createChat = async (
     `);
   });
 
-  console.log('[main] Creating window with config:', windowConfig);
-
   // Handle new window creation for links
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     // Open all links in external browser
@@ -531,25 +554,14 @@ const createChat = async (
       : `?view=${encodeURIComponent(viewType)}`;
   }
 
-  const primaryDisplay = electron.screen.getPrimaryDisplay();
-  const { width } = primaryDisplay.workAreaSize;
-
   // Increment window counter to track number of windows
   const windowId = ++windowCounter;
-  const direction = windowId % 2 === 0 ? 1 : -1; // Alternate direction
-  const initialOffset = 50;
-
-  // Set window position with alternating offset strategy
-  const baseXPosition = Math.round(width / 2 - mainWindow.getSize()[0] / 2);
-  const xOffset = direction * initialOffset * Math.floor(windowId / 2);
-  mainWindow.setPosition(baseXPosition + xOffset, 100);
 
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(`${MAIN_WINDOW_VITE_DEV_SERVER_URL}${queryParams}`);
   } else {
     // In production, we need to use a proper file protocol URL with correct base path
     const indexPath = path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`);
-    console.log('Loading production path:', indexPath);
     mainWindow.loadFile(indexPath, {
       search: queryParams ? queryParams.slice(1) : undefined,
     });
@@ -604,14 +616,11 @@ const createTray = () => {
 
   tray = new Tray(iconPath);
 
-  const contextMenu = Menu.buildFromTemplate([
-    { label: 'Show Window', click: showWindow },
-    { type: 'separator' },
-    { label: 'Quit', click: () => app.quit() },
-  ]);
+  // Set tray reference for auto-updater
+  setTrayRef(tray);
 
-  tray.setToolTip('Goose');
-  tray.setContextMenu(contextMenu);
+  // Initially build menu based on update status
+  updateTrayMenu(getUpdateAvailable());
 
   // On Windows, clicking the tray icon should show the window
   if (process.platform === 'win32') {
@@ -673,9 +682,28 @@ const openDirectoryDialog = async (
   })) as unknown as OpenDialogReturnValue;
 
   if (!result.canceled && result.filePaths.length > 0) {
-    addRecentDir(result.filePaths[0]);
+    const selectedPath = result.filePaths[0];
+
+    // If a file was selected, use its parent directory
+    let dirToAdd = selectedPath;
+    try {
+      const stats = fsSync.lstatSync(selectedPath);
+
+      // Reject symlinks for security
+      if (stats.isSymbolicLink()) {
+        console.warn(`Selected path is a symlink, using parent directory for security`);
+        dirToAdd = path.dirname(selectedPath);
+      } else if (stats.isFile()) {
+        dirToAdd = path.dirname(selectedPath);
+      }
+    } catch (error) {
+      console.warn(`Could not stat selected path, using parent directory`);
+      dirToAdd = path.dirname(selectedPath); // Fallback to parent directory
+    }
+
+    addRecentDir(dirToAdd);
     const currentWindow = BrowserWindow.getFocusedWindow();
-    await createChat(app, undefined, result.filePaths[0]);
+    await createChat(app, undefined, dirToAdd);
     if (replaceWindow && currentWindow) {
       currentWindow.close();
     }
@@ -785,6 +813,62 @@ ipcMain.handle('get-dock-icon-state', () => {
   } catch (error) {
     console.error('Error getting dock icon state:', error);
     return true;
+  }
+});
+
+// Handle opening system notifications preferences
+ipcMain.handle('open-notifications-settings', async () => {
+  try {
+    if (process.platform === 'darwin') {
+      spawn('open', ['x-apple.systempreferences:com.apple.preference.notifications']);
+      return true;
+    } else if (process.platform === 'win32') {
+      // Windows: Open notification settings in Settings app
+      spawn('ms-settings:notifications', { shell: true });
+      return true;
+    } else if (process.platform === 'linux') {
+      // Linux: Try different desktop environments
+      // GNOME
+      try {
+        spawn('gnome-control-center', ['notifications']);
+        return true;
+      } catch (gnomeError) {
+        console.log('GNOME control center not found, trying other options');
+      }
+
+      // KDE Plasma
+      try {
+        spawn('systemsettings5', ['kcm_notifications']);
+        return true;
+      } catch (kdeError) {
+        console.log('KDE systemsettings5 not found, trying other options');
+      }
+
+      // XFCE
+      try {
+        spawn('xfce4-settings-manager', ['--socket-id=notifications']);
+        return true;
+      } catch (xfceError) {
+        console.log('XFCE settings manager not found, trying other options');
+      }
+
+      // Fallback: Try to open general settings
+      try {
+        spawn('gnome-control-center');
+        return true;
+      } catch (fallbackError) {
+        console.warn('Could not find a suitable settings application for Linux');
+        return false;
+      }
+    } else {
+      console.warn(
+        `Opening notification settings is not supported on platform: ${process.platform}`
+      );
+      return false;
+    }
+  } catch (error) {
+    console.error('Error opening notification settings:', error);
+    return false;
   }
 });
 
@@ -1118,7 +1202,7 @@ ipcMain.handle('get-allowed-extensions', async () => {
 const createNewWindow = async (app: App, dir?: string | null) => {
   const recentDirs = loadRecentDirs();
   const openDir = dir || (recentDirs.length > 0 ? recentDirs[0] : undefined);
-  createChat(app, undefined, openDir);
+  return await createChat(app, undefined, openDir);
 };
 
 const focusWindow = () => {
@@ -1156,6 +1240,9 @@ const registerGlobalHotkey = (accelerator: string) => {
 };
 
 app.whenReady().then(async () => {
+  // Register update IPC handlers once (but don't setup auto-updater yet)
+  registerUpdateIpcHandlers();
+
   // Add CSP headers to all sessions
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
@@ -1170,7 +1257,7 @@ app.whenReady().then(async () => {
           // Images from our app and data: URLs (for base64 images)
           "img-src 'self' data: https:;" +
           // Connect to our local API and specific external services
-          "connect-src 'self' http://127.0.0.1:*" +
+          "connect-src 'self' http://127.0.0.1:* https://api.github.com https://github.com https://objects.githubusercontent.com" +
           // Don't allow any plugins
           "object-src 'none';" +
           // Don't allow any frames
@@ -1224,7 +1311,19 @@ app.whenReady().then(async () => {
   // Parse command line arguments
   const { dirPath } = parseArgs();
 
-  createNewWindow(app, dirPath);
+  await createNewWindow(app, dirPath);
+
+  // Setup auto-updater AFTER window is created and displayed (with delay to avoid blocking)
+  setTimeout(() => {
+    if (shouldSetupUpdater()) {
+      log.info('Setting up auto-updater after window creation...');
+      try {
+        setupAutoUpdater();
+      } catch (error) {
+        log.error('Error setting up auto-updater:', error);
+      }
+    }
+  }, 2000); // 2 second delay after window is shown
 
   // Get the existing menu
   const menu = Menu.getApplicationMenu();
@@ -1420,7 +1519,7 @@ app.whenReady().then(async () => {
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      createChat(app);
+      createNewWindow(app);
     }
   });
 
@@ -1595,6 +1694,17 @@ app.whenReady().then(async () => {
       console.error('Error opening URL in Chrome:', error);
     }
   });
+
+  // Handle app restart
+  ipcMain.on('restart-app', () => {
+    app.relaunch();
+    app.exit(0);
+  });
+
+  // Handler for getting app version
+  ipcMain.on('get-app-version', (event) => {
+    event.returnValue = app.getVersion();
+  });
 });
 
 /**
@@ -1730,8 +1840,10 @@ app.on('before-quit', async (event) => {
       // User clicked "Quit"
       // Set a flag to avoid showing the dialog again
       app.removeAllListeners('before-quit');
-      // Actually quit the app
-      app.quit();
+      // Force quit the app
+      process.nextTick(() => {
+        app.exit(0);
+      });
     }
   } catch (error) {
     console.error('Error showing quit dialog:', error);
